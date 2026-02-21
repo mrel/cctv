@@ -1,0 +1,251 @@
+# ============================================================
+# Docker Compose - IPTV Facial Recognition Surveillance System
+# One-command local deployment
+# ============================================================
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database with pgvector
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: surveillance-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: surveillance
+      POSTGRES_PASSWORD: surveillance
+      POSTGRES_DB: surveillance_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U surveillance -d surveillance_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - surveillance-network
+
+  # Redis for caching and message queuing
+  redis:
+    image: redis:7-alpine
+    container_name: surveillance-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - surveillance-network
+
+  # MinIO Object Storage
+  minio:
+    image: minio/minio:latest
+    container_name: surveillance-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - surveillance-network
+
+  # Backend API (FastAPI)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: surveillance-backend
+    restart: unless-stopped
+    environment:
+      DEBUG: "false"
+      DATABASE_URL: postgresql://surveillance:surveillance@postgres:5432/surveillance_db
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+      JWT_SECRET: your-jwt-secret-change-in-production
+      JWT_EXPIRATION_HOURS: "24"
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:5173"
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./backend/app:/app/app:ro
+    networks:
+      - surveillance-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend (React)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: surveillance-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:8000/api/v1
+      VITE_WS_URL: ws://localhost:8000/api/v1/ws
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - surveillance-network
+
+  # Stream Ingestion Service
+  ingestion:
+    build:
+      context: ./workers/ingestion
+      dockerfile: Dockerfile
+    container_name: surveillance-ingestion
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://surveillance:surveillance@postgres:5432/surveillance_db
+      REDIS_URL: redis://redis:6379/0
+      FRAME_SAMPLE_RATE: "2"
+      RECONNECT_ATTEMPTS: "5"
+      RECONNECT_DELAY: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - surveillance-network
+
+  # Detection Worker (GPU-enabled)
+  detection:
+    build:
+      context: ./workers/detection
+      dockerfile: Dockerfile
+    container_name: surveillance-detection
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DETECTION_MODEL_PATH: /models/yolov8n-face.onnx
+      DETECTION_THRESHOLD: "0.7"
+      BATCH_SIZE: "4"
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    depends_on:
+      - redis
+      - ingestion
+    networks:
+      - surveillance-network
+
+  # Recognition Worker (GPU-enabled)
+  recognition:
+    build:
+      context: ./workers/recognition
+      dockerfile: Dockerfile
+    container_name: surveillance-recognition
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://surveillance:surveillance@postgres:5432/surveillance_db
+      REDIS_URL: redis://redis:6379/0
+      RECOGNITION_MODEL_PATH: /models/arcface_r50.onnx
+      RECOGNITION_THRESHOLD: "0.6"
+      EMBEDDING_DIMENSION: "512"
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - surveillance-network
+
+  # Alert Engine
+  alert-engine:
+    build:
+      context: ./workers/alert-engine
+      dockerfile: Dockerfile
+    container_name: surveillance-alert-engine
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://surveillance:surveillance@postgres:5432/surveillance_db
+      REDIS_URL: redis://redis:6379/0
+      WEBHOOK_TIMEOUT: "10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - surveillance-network
+
+  # Nginx Load Balancer / API Gateway
+  nginx:
+    image: nginx:alpine
+    container_name: surveillance-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - surveillance-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  surveillance-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
